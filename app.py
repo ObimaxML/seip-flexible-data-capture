@@ -13,9 +13,9 @@ import streamlit as st
 from openpyxl import load_workbook
 
 try:
-    from streamlit_js_eval import streamlit_js_eval
+    from streamlit_geolocation import streamlit_geolocation
 except Exception:
-    streamlit_js_eval = None
+    streamlit_geolocation = None
 
 
 APP_TITLE = "SEIP Flexible Data Capture"
@@ -357,6 +357,19 @@ def normalise_key(name: str) -> str:
     )
 
 
+def is_empty_value(value: Any) -> bool:
+    if value is None:
+        return True
+
+    try:
+        if pd.isna(value):
+            return True
+    except Exception:
+        pass
+
+    return str(value).strip() == ""
+
+
 def get_area_id_config(area_key: str, capture_sheet: str) -> Dict[str, str]:
     area_key_norm = normalise_key(area_key)
     capture_sheet_norm = normalise_key(capture_sheet)
@@ -409,54 +422,9 @@ def save_uploaded_template(uploaded_file) -> Path:
     return upload_path
 
 
-def is_empty_value(value: Any) -> bool:
-    if value is None:
-        return True
-
-    try:
-        if pd.isna(value):
-            return True
-    except Exception:
-        pass
-
-    return str(value).strip() == ""
-
-
 # ============================================================
-# SOUTH AFRICAN ID VALIDATION
+# SOUTH AFRICAN ID + DATE OF BIRTH
 # ============================================================
-
-def is_sa_id_number(value: Any) -> bool:
-    id_number = re.sub(r"\D", "", str(value or ""))
-
-    if len(id_number) != 13:
-        return False
-
-    try:
-        yy = int(id_number[0:2])
-        mm = int(id_number[2:4])
-        dd = int(id_number[4:6])
-    except Exception:
-        return False
-
-    current_yy = int(str(datetime.now().year)[-2:])
-    century = 2000 if yy <= current_yy else 1900
-
-    try:
-        date(century + yy, mm, dd)
-    except ValueError:
-        return False
-
-    try:
-        total_odd = sum(int(id_number[i]) for i in range(0, 12, 2))
-        even_digits = "".join(id_number[i] for i in range(1, 12, 2))
-        doubled_even = str(int(even_digits) * 2)
-        total_even = sum(int(d) for d in doubled_even)
-        check_digit = (10 - ((total_odd + total_even) % 10)) % 10
-        return check_digit == int(id_number[-1])
-    except Exception:
-        return False
-
 
 def looks_like_id_number_field(field_name: str) -> bool:
     field = normalise_key(field_name)
@@ -471,6 +439,76 @@ def looks_like_id_number_field(field_name: str) -> bool:
         "national_id",
         "identity_number",
     }
+
+
+def looks_like_dob_field(field_name: str) -> bool:
+    field = normalise_key(field_name)
+
+    return field in {
+        "date_of_birth",
+        "dob",
+        "birth_date",
+        "birthdate",
+        "respondent_date_of_birth",
+    }
+
+
+def derive_dob_from_sa_id_first6(value: Any) -> date | None:
+    """
+    Derives date of birth from the first 6 digits of a South African ID number.
+
+    Format: YYMMDD
+
+    No age restriction is applied.
+    Century is inferred as:
+    - YY <= current year YY: 2000s
+    - YY > current year YY: 1900s
+    """
+    id_number = re.sub(r"\D", "", str(value or ""))
+
+    if len(id_number) < 6:
+        return None
+
+    yy = id_number[0:2]
+    mm = id_number[2:4]
+    dd = id_number[4:6]
+
+    try:
+        yy_int = int(yy)
+        mm_int = int(mm)
+        dd_int = int(dd)
+
+        current_yy = int(str(datetime.now().year)[-2:])
+        century = 2000 if yy_int <= current_yy else 1900
+
+        return date(century + yy_int, mm_int, dd_int)
+
+    except Exception:
+        return None
+
+
+def is_sa_id_number(value: Any) -> bool:
+    id_number = re.sub(r"\D", "", str(value or ""))
+
+    if len(id_number) != 13:
+        return False
+
+    dob = derive_dob_from_sa_id_first6(id_number)
+
+    if dob is None:
+        return False
+
+    try:
+        total_odd = sum(int(id_number[i]) for i in range(0, 12, 2))
+        even_digits = "".join(id_number[i] for i in range(1, 12, 2))
+        doubled_even = str(int(even_digits) * 2)
+        total_even = sum(int(d) for d in doubled_even)
+        check_digit = (10 - ((total_odd + total_even) % 10)) % 10
+
+        return check_digit == int(id_number[-1])
+
+    except Exception:
+        return False
 
 
 # ============================================================
@@ -617,6 +655,9 @@ def infer_widget_type(field_name: str, data_type: str, example: Any) -> str:
     if looks_like_id_number_field(field_name):
         return "id_number"
 
+    if looks_like_dob_field(field_name):
+        return "auto_dob"
+
     if "BOOLEAN" in dtype or isinstance(example, bool):
         return "boolean"
 
@@ -670,6 +711,36 @@ def get_form_version(area_key: str) -> int:
     return int(st.session_state.get(f"reset_version_{area_key}", 0))
 
 
+def order_fields_for_form(fields_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Moves ID number before Date of Birth so DOB can be derived immediately.
+    Everything else keeps its original order.
+    """
+    if fields_df.empty or "field_name" not in fields_df.columns:
+        return fields_df
+
+    df = fields_df.copy()
+    df["_original_order"] = range(len(df))
+
+    def priority(field_name: Any) -> int:
+        name = str(field_name)
+
+        if looks_like_id_number_field(name):
+            return 0
+
+        if looks_like_dob_field(name):
+            return 1
+
+        return 2
+
+    df["_priority"] = df["field_name"].apply(priority)
+    df = df.sort_values(["_priority", "_original_order"]).drop(
+        columns=["_priority", "_original_order"]
+    )
+
+    return df
+
+
 def build_form(
     area_key: str,
     fields_df: pd.DataFrame,
@@ -679,7 +750,12 @@ def build_form(
     values: Dict[str, Any] = {}
     validation_errors: List[str] = []
 
-    for _, row in fields_df.iterrows():
+    detected_dob: date | None = None
+    id_number_entered = ""
+
+    ordered_fields_df = order_fields_for_form(fields_df)
+
+    for _, row in ordered_fields_df.iterrows():
         field_name = str(row.get("field_name", "")).strip()
 
         if not field_name or field_name.lower() == "nan":
@@ -758,6 +834,30 @@ def build_form(
                 key=key,
             )
 
+        elif widget_type == "auto_dob":
+            if detected_dob is not None:
+                st.text_input(
+                    label,
+                    value=detected_dob.isoformat(),
+                    disabled=True,
+                    help="Automatically detected from the first 6 digits of the South African ID number.",
+                    key=key,
+                )
+                value = detected_dob.isoformat()
+                st.success(f"Date of Birth detected from ID number: {detected_dob.isoformat()}")
+            else:
+                st.text_input(
+                    label,
+                    value="",
+                    disabled=True,
+                    help="Enter the South African ID number above to auto-detect date of birth.",
+                    key=key,
+                )
+                value = None
+
+            values[field_name] = value
+            continue
+
         elif widget_type == "integer":
             value = st.number_input(
                 label,
@@ -795,7 +895,10 @@ def build_form(
             value = st.text_input(
                 label,
                 value="",
-                help="Optional. If entered, it must be a valid 13-digit South African ID number.",
+                help=(
+                    "Optional. Enter a South African ID number. "
+                    "Date of Birth is automatically detected from the first 6 digits."
+                ),
                 key=key,
                 max_chars=13,
             )
@@ -806,13 +909,26 @@ def build_form(
                 st.warning("ID number must contain digits only.")
 
             value = cleaned_id
+            id_number_entered = cleaned_id
 
-            if value:
-                if is_sa_id_number(value):
-                    st.success("Valid South African ID number.")
+            detected_dob = derive_dob_from_sa_id_first6(cleaned_id)
+
+            if cleaned_id and len(cleaned_id) >= 6:
+                if detected_dob is not None:
+                    st.info(f"Detected Date of Birth: {detected_dob.isoformat()}")
                 else:
-                    st.error("Invalid South African ID number.")
-                    validation_errors.append("ID number is not a valid South African ID.")
+                    st.warning("Could not detect Date of Birth from the first 6 ID digits.")
+
+            if cleaned_id:
+                if len(cleaned_id) == 13:
+                    if is_sa_id_number(cleaned_id):
+                        st.success("Valid South African ID number.")
+                    else:
+                        st.error("Invalid South African ID number.")
+                        validation_errors.append("ID number is not a valid South African ID.")
+                elif len(cleaned_id) < 13:
+                    st.warning("ID number entered but incomplete. Enter 13 digits or leave it blank.")
+                    validation_errors.append("ID number is incomplete.")
 
         else:
             value = st.text_input(
@@ -876,65 +992,6 @@ def next_dynamic_id_for_area(
 # GPS CAPTURE
 # ============================================================
 
-def get_browser_gps(component_key: str) -> Dict[str, Any] | None:
-    if streamlit_js_eval is None:
-        st.error(
-            "Automatic GPS requires `streamlit-js-eval`. "
-            "Install it with: pip install streamlit-js-eval"
-        )
-        return None
-
-    gps = streamlit_js_eval(
-        js_expressions="""
-        new Promise((resolve) => {
-            if (!navigator.geolocation) {
-                resolve({
-                    ok: false,
-                    error: "Geolocation is not supported by this browser."
-                });
-            } else {
-                navigator.geolocation.getCurrentPosition(
-                    (position) => {
-                        resolve({
-                            ok: true,
-                            latitude: position.coords.latitude,
-                            longitude: position.coords.longitude,
-                            accuracy: position.coords.accuracy,
-                            timestamp: position.timestamp
-                        });
-                    },
-                    (error) => {
-                        let message = "Unknown GPS error";
-
-                        if (error.code === 1) {
-                            message = "Location permission was denied. Please allow location access in the browser.";
-                        } else if (error.code === 2) {
-                            message = "Location unavailable. Turn on device location/GPS.";
-                        } else if (error.code === 3) {
-                            message = "GPS request timed out. Try again.";
-                        }
-
-                        resolve({
-                            ok: false,
-                            error: message,
-                            code: error.code
-                        });
-                    },
-                    {
-                        enableHighAccuracy: true,
-                        timeout: 20000,
-                        maximumAge: 0
-                    }
-                );
-            }
-        })
-        """,
-        key=component_key,
-    )
-
-    return gps
-
-
 def build_gps_capture(
     area_key: str,
     form_version: int,
@@ -965,57 +1022,49 @@ def build_gps_capture(
             "gps_captured_at": None,
         }
 
+    if streamlit_geolocation is None:
+        st.error(
+            "Automatic GPS requires `streamlit-geolocation`. "
+            "Install it with: pip install streamlit-geolocation"
+        )
+        return {
+            "gps_capture_required": True,
+            "gps_capture_method": "gps_component_missing",
+            "gps_latitude": None,
+            "gps_longitude": None,
+            "gps_coordinates": None,
+            "gps_accuracy_meters": None,
+            "gps_captured_at": None,
+        }
+
     st.warning(
-        "Click `Detect GPS automatically`, then allow location access in your browser. "
-        "GPS works best on a phone and requires localhost or HTTPS."
+        "Click the location button below and allow location access in your browser. "
+        "For mobile fieldwork, use HTTPS. For local testing, use http://localhost:8501."
     )
 
-    detect_button = st.button(
-        "Detect GPS automatically",
-        use_container_width=True,
-        key=f"{area_key}_detect_gps_btn_{form_version}",
-    )
+    location = streamlit_geolocation()
 
-    if detect_button:
-        with st.spinner("Requesting GPS location from browser..."):
-            gps_result = get_browser_gps(
-                component_key=f"{area_key}_browser_gps_{form_version}_{datetime.now().timestamp()}",
-            )
+    if location and isinstance(location, dict):
+        latitude = location.get("latitude")
+        longitude = location.get("longitude")
+        accuracy = location.get("accuracy")
 
-        if gps_result is not None:
-            st.session_state[gps_state_key] = gps_result
-            st.rerun()
-
-    gps_result = st.session_state.get(gps_state_key)
-
-    gps_record = {
-        "gps_capture_required": True,
-        "gps_capture_method": "not_captured",
-        "gps_latitude": None,
-        "gps_longitude": None,
-        "gps_coordinates": None,
-        "gps_accuracy_meters": None,
-        "gps_captured_at": None,
-    }
-
-    if gps_result and isinstance(gps_result, dict):
-        if gps_result.get("ok"):
-            latitude = float(gps_result.get("latitude"))
-            longitude = float(gps_result.get("longitude"))
-            accuracy = gps_result.get("accuracy", None)
+        if latitude is not None and longitude is not None:
+            latitude = float(latitude)
+            longitude = float(longitude)
             gps_coordinates = f"{latitude:.6f}, {longitude:.6f}"
 
-            gps_record.update(
-                {
-                    "gps_capture_required": True,
-                    "gps_capture_method": "browser_geolocation",
-                    "gps_latitude": latitude,
-                    "gps_longitude": longitude,
-                    "gps_coordinates": gps_coordinates,
-                    "gps_accuracy_meters": float(accuracy) if accuracy is not None else None,
-                    "gps_captured_at": datetime.now().isoformat(timespec="seconds"),
-                }
-            )
+            gps_record = {
+                "gps_capture_required": True,
+                "gps_capture_method": "browser_geolocation",
+                "gps_latitude": latitude,
+                "gps_longitude": longitude,
+                "gps_coordinates": gps_coordinates,
+                "gps_accuracy_meters": float(accuracy) if accuracy is not None else None,
+                "gps_captured_at": datetime.now().isoformat(timespec="seconds"),
+            }
+
+            st.session_state[gps_state_key] = gps_record
 
             st.success("GPS detected successfully.")
             st.markdown("##### Captured GPS Coordinates")
@@ -1038,27 +1087,53 @@ def build_gps_capture(
                 zoom=15,
             )
 
-        else:
-            st.error(
-                "Could not detect GPS automatically: "
-                + str(gps_result.get("error", "Unknown browser GPS error"))
-            )
-            st.markdown("##### Captured GPS Coordinates")
-            st.code("Not captured yet")
+            return gps_record
 
-    else:
-        st.info(
-            "GPS has not been captured yet. Click `Detect GPS automatically` "
-            "and allow location access in the browser."
-        )
+    existing_record = st.session_state.get(gps_state_key)
+
+    if existing_record and existing_record.get("gps_coordinates"):
+        st.success("GPS already detected.")
         st.markdown("##### Captured GPS Coordinates")
-        st.code("Not captured yet")
+        st.code(existing_record["gps_coordinates"])
 
-    return gps_record
+        try:
+            map_df = pd.DataFrame(
+                {
+                    "lat": [float(existing_record["gps_latitude"])],
+                    "lon": [float(existing_record["gps_longitude"])],
+                }
+            )
+
+            st.map(
+                map_df,
+                latitude="lat",
+                longitude="lon",
+                zoom=15,
+            )
+        except Exception:
+            pass
+
+        return existing_record
+
+    st.info(
+        "GPS has not been captured yet. Click the location button above and allow browser location access."
+    )
+    st.markdown("##### Captured GPS Coordinates")
+    st.code("Not captured yet")
+
+    return {
+        "gps_capture_required": True,
+        "gps_capture_method": "not_captured",
+        "gps_latitude": None,
+        "gps_longitude": None,
+        "gps_coordinates": None,
+        "gps_accuracy_meters": None,
+        "gps_captured_at": None,
+    }
 
 
 # ============================================================
-# EXCEL SAVE / READ / DELETE / RESET / UPDATE
+# EXCEL SAVE / READ / DELETE / RESET
 # ============================================================
 
 def append_record(
@@ -1180,12 +1255,38 @@ def validate_inline_dataframe(df: pd.DataFrame) -> List[str]:
                 if not is_empty_value(value):
                     cleaned_id = re.sub(r"\D", "", str(value))
 
-                    if not is_sa_id_number(cleaned_id):
-                        errors.append(
-                            f"Row {idx}: `{column}` is not a valid South African ID number."
-                        )
+                    if len(cleaned_id) == 13:
+                        if not is_sa_id_number(cleaned_id):
+                            errors.append(
+                                f"Row {idx}: `{column}` is not a valid South African ID number."
+                            )
 
     return errors
+
+
+def auto_update_inline_dob_from_id(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    When inline editing ID number, automatically updates any Date of Birth column.
+    """
+    id_columns = [col for col in df.columns if looks_like_id_number_field(col)]
+    dob_columns = [col for col in df.columns if looks_like_dob_field(col)]
+
+    if not id_columns or not dob_columns:
+        return df
+
+    updated_df = df.copy()
+
+    id_col = id_columns[0]
+    dob_col = dob_columns[0]
+
+    for idx, value in updated_df[id_col].items():
+        if not is_empty_value(value):
+            detected_dob = derive_dob_from_sa_id_first6(value)
+
+            if detected_dob is not None:
+                updated_df.at[idx, dob_col] = detected_dob.isoformat()
+
+    return updated_df
 
 
 # ============================================================
@@ -1344,7 +1445,7 @@ with left:
         elif gps_required and not gps_coordinates:
             st.error(
                 "GPS detection was selected, but coordinates were not captured. "
-                "Click `Detect GPS automatically` and allow location access."
+                "Click the browser location button and allow location access."
             )
 
         else:
@@ -1439,6 +1540,7 @@ else:
             use_container_width=True,
             key=f"save_inline_edits_{capture_sheet}",
         ):
+            edited_df = auto_update_inline_dob_from_id(edited_df)
             inline_errors = validate_inline_dataframe(edited_df)
 
             if inline_errors:
