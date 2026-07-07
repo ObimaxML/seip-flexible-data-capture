@@ -1,0 +1,9 @@
+<svg width="420" height="180" viewBox="0 0 420 180" xmlns="http://www.w3.org/2000/svg">
+  <rect width="420" height="180" rx="28" fill="#0F766E"/>
+  <circle cx="90" cy="90" r="48" fill="#FFFFFF" opacity="0.95"/>
+  <path d="M68 98 C80 70, 105 70, 118 98" stroke="#0F766E" stroke-width="12" fill="none" stroke-linecap="round"/>
+  <circle cx="78" cy="78" r="8" fill="#0F766E"/>
+  <circle cx="108" cy="78" r="8" fill="#0F766E"/>
+  <text x="160" y="78" font-family="Arial, sans-serif" font-size="38" font-weight="700" fill="#FFFFFF">SEIP</text>
+  <text x="160" y="116" font-family="Arial, sans-serif" font-size="17" fill="#CCFBF1">Data Capture</text>
+</svg>
